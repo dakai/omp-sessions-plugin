@@ -1,0 +1,1 @@
+{"description": "Sweep + jump across all omp/pi sessions: naming audit and cross-project resume picker.", "license": "MIT", "name": "omp-sessions", "private": true, "type": "module", "version": "1.0.0", "omp": {"extensions": ["./sessions.ts"]}, "pi": {"extensions": ["./sessions.ts"]}}

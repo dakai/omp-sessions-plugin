@@ -1,0 +1,194 @@
+#!/usr/bin/python3
+"""sesspick: list all omp/pi sessions for fzf, print '<cwd>\\t<path>' of the pick.
+
+Usage:
+    sesspick [--query STR] [--preview ID]   # ID = session id prefix
+    sesspick --list                         # TSV to stdout, no fzf
+
+List order: last real conversation activity first (content timestamps,
+never filesystem mtime — mtime lies after any rename append).
+
+Review pane: fzf --preview 'sesspick --preview {id}' shows the session's
+last user/assistant turns. The {id} is the trailing short-id field.
+"""
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
+
+SESS_ROOT = os.path.join(
+    os.environ.get("PI_CODING_AGENT_DIR", os.path.expanduser("~/.omp/agent")),
+    "sessions",
+)
+CAP = 400
+
+
+def msg_text(msg):
+    if isinstance(msg, str):
+        return msg
+    if not isinstance(msg, dict):
+        return ""
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(
+            x if isinstance(x, str) else (x.get("text", "") if isinstance(x, dict) else "")
+            for x in c
+        )
+    return ""
+
+
+def read_session(path, project):
+    sid = cwd = created = header_title = ""
+    name = None
+    first_user = ""
+    turns = []  # (role, text) user/assistant only, in file order
+    msg_count = 0
+    last_activity = 0
+    try:
+        fh = open(path, encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    with fh:
+        header_seen = False
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(e, dict):
+                continue
+            if not header_seen:
+                if e.get("type") != "session":
+                    continue  # line 0 is the {"type":"title"} cache sidecar
+                header_seen = True
+                sid = e.get("id", "") or ""
+                cwd = e.get("cwd", "") or ""
+                created = e.get("timestamp", "") or ""
+                header_title = e.get("title", "") or ""
+                continue
+            if e.get("type") == "session_info" and isinstance(e.get("name"), str):
+                name = e["name"].strip() or None
+            elif e.get("type") == "message":
+                msg_count += 1
+                m = e.get("message")
+                if not isinstance(m, dict):
+                    continue
+                ts = e.get("timestamp", "")
+                try:
+                    t = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+                    last_activity = max(last_activity, t)
+                except ValueError:
+                    pass
+                role = m.get("role")
+                if role in ("user", "assistant"):
+                    text = " ".join(msg_text(m).split())
+                    if text:
+                        turns.append((role, text))
+                        if role == "user" and not first_user:
+                            first_user = text
+    if not sid:
+        return None
+    effective = name or header_title.strip() or None
+    display = effective or (first_user[:60] if first_user else "(untitled)")
+    try:
+        created_ts = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        created_ts = 0
+    return {
+        "id": sid,
+        "cwd": cwd,
+        "activity": last_activity or created_ts,
+        "display": display,
+        "project": project,
+        "path": path,
+        "turns": turns,
+        "msg_count": msg_count,
+    }
+
+
+def scan():
+    rows = []
+    try:
+        projects = os.listdir(SESS_ROOT)
+    except OSError:
+        return rows
+    for proj in projects:
+        d = os.path.join(SESS_ROOT, proj)
+        if not os.path.isdir(d):
+            continue
+        for f in os.listdir(d):
+            if f.endswith(".jsonl"):
+                r = read_session(os.path.join(d, f), proj)
+                if r:
+                    rows.append(r)
+    rows.sort(key=lambda r: r["activity"], reverse=True)
+    return rows[:CAP]
+
+
+def stamp(ts):
+    d = datetime.fromtimestamp(ts).astimezone()
+    return d.strftime("%m%d %H:%M")
+
+
+def row_line(r):
+    proj = r["project"].lstrip("-").replace("-", "/")
+    return f"{stamp(r['activity'])}｜{r['display']}\t[{proj}]\t{r['id'][:8]}"
+
+
+def main(argv):
+    if argv[:1] == ["--preview"]:
+        want = (argv[1] if len(argv) > 1 else "").lower()
+        for r in scan():
+            if r["id"].lower().startswith(want):
+                print(f"{r['display']}\n{r['cwd']}\n{r['path']}\n")
+                for role, text in r["turns"][-12:]:
+                    tag = "YOU" if role == "user" else "OMP"
+                    print(f"[{tag}] {text[:500]}")
+                    print()
+                return 0
+        return 1
+    rows = scan()
+    if argv[:1] == ["--list"]:
+        for r in rows:
+            print(f"{row_line(r)}\t{r['cwd']}\t{r['path']}")
+        return 0
+    query = ""
+    if argv[:1] == ["--query"]:
+        query = argv[1] if len(argv) > 1 else ""
+    me = os.path.realpath(__file__)
+    fzf = [
+        "/usr/bin/fzf",
+        "--prompt=sess> ",
+        "--with-nth=1,2,3",
+        "--delimiter=\t",
+        "--preview",
+        f"{me} --preview {{3}}",
+        "--preview-window=right:55%:wrap",
+        "--bind=esc:cancel",
+    ]
+    if query:
+        fzf.append(f"--query={query}")
+    p = subprocess.run(
+        fzf,
+        input="\n".join(row_line(r) + f"\t{r['cwd']}\t{r['path']}" for r in rows),
+        text=True,
+        capture_output=True,
+    )
+    if p.returncode != 0 or not p.stdout.strip():
+        return 1
+    fields = p.stdout.rstrip("\n").split("\t")
+    # print '<cwd>\t<path>' for the shell wrapper to cd + resume
+    print(f"{fields[-2]}\t{fields[-1]}")
+    return 0
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.stderr.close()
+        sys.exit(0)
