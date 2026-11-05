@@ -3,16 +3,21 @@
 
 Usage:
     sesspick [--query STR] [--preview ID]   # ID = session id prefix
+    sesspick [--grep PATTERN]               # search user+assistant text
     sesspick --list                         # TSV to stdout, no fzf
 
 List order: last real conversation activity first (content timestamps,
 never filesystem mtime — mtime lies after any rename append).
+
+shortcut: content search covers user+assistant text only (tool output
+excluded); add a role filter here if tool output ever needs searching.
 
 Review pane: fzf --preview 'sesspick --preview {id}' shows the session's
 last user/assistant turns. The {id} is the trailing short-id field.
 """
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -21,7 +26,6 @@ SESS_ROOT = os.path.join(
     os.environ.get("PI_CODING_AGENT_DIR", os.path.expanduser("~/.omp/agent")),
     "sessions",
 )
-CAP = 400
 
 
 def msg_text(msg):
@@ -40,11 +44,20 @@ def msg_text(msg):
     return ""
 
 
-def read_session(path, project):
+def compile_pattern(q):
+    try:
+        return re.compile(q, re.I)
+    except re.error:
+        return re.compile(re.escape(q), re.I)
+
+
+def read_session(path, project, pattern=None):
     sid = cwd = created = header_title = ""
     name = None
     first_user = ""
     turns = []  # (role, text) user/assistant only, in file order
+    hits = []  # (role, snippet) around each match, for row/preview
+    hit_count = 0
     msg_count = 0
     last_activity = 0
     try:
@@ -89,6 +102,13 @@ def read_session(path, project):
                     text = " ".join(msg_text(m).split())
                     if text:
                         turns.append((role, text))
+                        if pattern is not None:
+                            for mo in pattern.finditer(text):
+                                hit_count += 1
+                                if len(hits) < 40:
+                                    hits.append(
+                                        (role, text[max(0, mo.start() - 60): mo.end() + 60])
+                                    )
                         if role == "user" and not first_user:
                             first_user = text
     if not sid:
@@ -107,11 +127,13 @@ def read_session(path, project):
         "project": project,
         "path": path,
         "turns": turns,
+        "hits": hits,
+        "hit_count": hit_count,
         "msg_count": msg_count,
     }
 
 
-def scan():
+def scan(pattern=None):
     rows = []
     try:
         projects = os.listdir(SESS_ROOT)
@@ -123,11 +145,14 @@ def scan():
             continue
         for f in os.listdir(d):
             if f.endswith(".jsonl"):
-                r = read_session(os.path.join(d, f), proj)
+                r = read_session(os.path.join(d, f), proj, pattern)
                 if r:
                     rows.append(r)
+    if pattern is not None:
+        # Title matches count too: `docker` should find a session named after it.
+        rows = [r for r in rows if r["hit_count"] or pattern.search(r["display"])]
     rows.sort(key=lambda r: r["activity"], reverse=True)
-    return rows[:CAP]
+    return rows
 
 
 def stamp(ts):
@@ -135,27 +160,48 @@ def stamp(ts):
     return d.strftime("%m%d %H:%M")
 
 
-def row_line(r):
+def row_line(r, pattern=None):
     proj = r["project"].lstrip("-").replace("-", "/")
-    return f"{stamp(r['activity'])}｜{r['display']}\t[{proj}]\t{r['id'][:8]}"
+    head = f"{stamp(r['activity'])}｜{r['display']}"
+    if pattern is None:
+        return f"{head}\t[{proj}]\t{r['id'][:8]}"
+    snip = f" ×{r['hit_count']} …{r['hits'][0][1]}…" if r["hits"] else ""
+    return f"{head}\t[{proj}]{snip}\t{r['id'][:8]}"
 
 
 def main(argv):
+    grep = None
+    if argv[:1] == ["--grep"]:
+        grep = argv[1] if len(argv) > 1 else ""
+        argv = argv[2:]
+    pattern = compile_pattern(grep) if grep else None
     if argv[:1] == ["--preview"]:
         want = (argv[1] if len(argv) > 1 else "").lower()
-        for r in scan():
+        # fzf runs the preview through a shell, so the pattern travels by env.
+        pattern = compile_pattern(os.environ["SESSPICK_GREP"]) if os.environ.get("SESSPICK_GREP") else None
+        for r in scan(pattern):
             if r["id"].lower().startswith(want):
-                print(f"{r['display']}\n{r['cwd']}\n{r['path']}\n")
-                for role, text in r["turns"][-12:]:
-                    tag = "YOU" if role == "user" else "OMP"
-                    print(f"[{tag}] {text[:500]}")
+                print(f"{r['display']}\n{r['cwd']}\n{r['path']}")
+                if pattern is not None:
+                    print(f"\n{r['hit_count']} content matches\n")
+                    for role, snip in r["hits"]:
+                        print(f"[{'YOU' if role == 'user' else 'OMP'}] …{snip}…")
+                        print()
+                else:
                     print()
+                    for role, text in r["turns"][-12:]:
+                        tag = "YOU" if role == "user" else "OMP"
+                        print(f"[{tag}] {text[:500]}")
+                        print()
                 return 0
         return 1
-    rows = scan()
+    rows = scan(pattern)
+    if pattern is not None and not rows:
+        print(f"sesspick: no session content matches {grep!r}", file=sys.stderr)
+        return 1
     if argv[:1] == ["--list"]:
         for r in rows:
-            print(f"{row_line(r)}\t{r['cwd']}\t{r['path']}")
+            print(f"{row_line(r, pattern)}\t{r['cwd']}\t{r['path']}")
         return 0
     query = ""
     if argv[:1] == ["--query"]:
@@ -175,9 +221,10 @@ def main(argv):
         fzf.append(f"--query={query}")
     p = subprocess.run(
         fzf,
-        input="\n".join(row_line(r) + f"\t{r['cwd']}\t{r['path']}" for r in rows),
+        input="\n".join(row_line(r, pattern) + f"\t{r['cwd']}\t{r['path']}" for r in rows),
         text=True,
         capture_output=True,
+        env=dict(os.environ, **({"SESSPICK_GREP": grep} if grep else {})),
     )
     if p.returncode != 0 or not p.stdout.strip():
         return 1

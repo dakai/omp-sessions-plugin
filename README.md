@@ -18,7 +18,9 @@ Sweep + jump across all omp/pi sessions on this host.
 - `/sessions-rename <id-prefix> <MMDD｜<type>｜<topic>>` — rename one.
 - `/sessions [query]` — cross-project list ordered by last real
   conversation activity (content timestamps, never filesystem mtime —
-  mtime lies after any rename append). No ordinal numbers (ordinals
+  mtime lies after any rename append). No limit: every session on the
+  host is reachable (the picker caps nothing; the widget truncates to
+  90 rows only in TUI, headless prints all). No ordinal numbers (ordinals
   hijack date search: typing `1011` matched `1. …`). Each row leads
   with `MMDD HH:MM｜`. TUI shows a type-to-filter picker that jumps
   via `switchSession`; headless prints paths for `omp -r <path>`.
@@ -37,7 +39,17 @@ extension selector does nothing observable. Standalone instead:
 ```
 sess [initial-query]   # fzf list (latest first) + right-side review pane
                        # Enter: cd to the session dir, omp --resume <path>
+sess -c <pattern>      # search session CONTENT, then jump
 ```
+
+`sess -c` matches the conversation text — user and assistant messages, not
+tool output — and lists only sessions with a hit, each row showing the hit
+count and the first matching snippet. Title matches still count, so `-c
+docker` also finds a session named after it. Regex by default
+(case-insensitive); an invalid regex is treated as a literal. The pattern
+reaches the preview pane through `SESSPICK_GREP`, so snippets render there
+instead of the last turns. Cost is one extra pass over the same scan `sess`
+already does (~2 s for 434 sessions / 560 MB here).
 
 Parts: `sesspick` (python scanner → fzf, symlinked to `~/.local/bin`)
 and `sess` (zsh function from `sess.zsh`, sourced via `~/.zshrc` —

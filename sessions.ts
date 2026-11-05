@@ -279,8 +279,10 @@ async function renameFile(row: SessionRow, newTitle: string): Promise<boolean> {
 
 function show(ctx: ExtensionCommandContext, key: string, lines: string[]): void {
   // Widget keeps long tables visible above the editor; notify carries the summary.
+  // Widget only in TUI: headless callers rely on the full printed list (no cap).
   try {
-    ctx.ui.setWidget(key, lines.slice(0, 90), { placement: "aboveEditor" });
+    const tui = ctx.hasUI && ctx.mode === "tui";
+    ctx.ui.setWidget(key, tui ? lines.slice(0, 90) : lines, { placement: "aboveEditor" });
   } catch {}
 }
 
@@ -351,6 +353,8 @@ export default function sessionsPlugin(pi: ExtensionAPI) {
         fresh++;
         st.scanned[r.path] = mark;
         if (r.name && RULE.test(r.name)) continue;
+        // No title and no user text: nothing to derive a topic from, keep the original.
+        if (!r.name && !r.firstUser) continue;
         if (st.pending.some((p) => p.id === r.id)) continue;
         const draft = draftName(r);
         st.pending.push({
@@ -367,7 +371,7 @@ export default function sessionsPlugin(pi: ExtensionAPI) {
       for (const r of rows) live[r.id] = r;
       st.pending = st.pending.filter((p) => {
         const r = live[p.id];
-        return r && (r.name ?? "") !== p.newTitle && (!r.name || !RULE.test(r.name));
+        return r && (r.name || r.firstUser) && (r.name ?? "") !== p.newTitle && (!r.name || !RULE.test(r.name));
       });
       await fs.writeFile(scanStatePath(), JSON.stringify(st, null, 2));
 
@@ -435,16 +439,16 @@ export default function sessionsPlugin(pi: ExtensionAPI) {
       }
       const q = (args || "").trim().toLowerCase();
       const pool = q ? rows.filter((r) => `${r.display} ${r.firstUser} ${r.project} ${r.id}`.toLowerCase().includes(q)) : rows;
-      const capped = pool.slice(0, 150); // scanAll is activity-desc: latest real conversation at top
+      // scanAll is activity-desc: latest real conversation at top. No cap — every session is reachable.
       // No ordinal prefixes: a leading "1. " hijacks date search ("1011" matches "1. …" first).
-      const options = capped.map((r) => {
+      const options = pool.map((r) => {
         const d = new Date(r.activityMs);
         const stamp = `${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
         return `${stamp}｜${r.display} [${r.project.replace(/^-+/, "").replace(/-+/g, "/")}] ${r.id.slice(0, 8)}`;
       });
       show(ctx, "sessions", [
         `sessions: ${pool.length} shown (${rows.length} total), latest first. Type to filter, Enter jumps — or resume directly:`,
-        ...capped.map((r, i) => `  ${options[i]} ${r.path}`),
+        ...pool.map((r, i) => `  ${options[i]} ${r.path}`),
       ]);
       if (!ctx.hasUI || ctx.mode !== "tui") {
         ctx.ui.notify("Pick a path from the list above and run: omp -r <path>", "info");
@@ -452,7 +456,7 @@ export default function sessionsPlugin(pi: ExtensionAPI) {
       }
       const choice = await ctx.ui.select("Jump to session (type to filter)", options);
       if (!choice) return;
-      const target = capped[options.indexOf(choice)];
+      const target = pool[options.indexOf(choice)];
       if (!target) {
         ctx.ui.notify("sessions: choice did not match any row — report this.", "error");
         return;
